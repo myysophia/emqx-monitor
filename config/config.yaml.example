@@ -1,0 +1,88 @@
+# EMQX 监控服务配置示例
+# 使用方法: cp config.yaml.example config.yaml
+# 然后修改配置文件中的占位符
+
+# EMQX K8s 配置
+emqx:
+  namespace: ems-au
+  pod: emqx-eu-0
+
+# 采集间隔
+collect_interval: 30s
+
+# 告警检查间隔
+check_interval: 1h
+
+# HTTP 服务端口
+server_port: 8080
+
+# 企业微信 Webhook
+webhook_url: https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=YOUR_WEBHOOK_KEY
+
+# 周报配置
+report:
+  # 是否启用周报
+  enabled: true
+  # 发送时间 (0-6, 0=周日, 1=周一, ..., 6=周六)
+  day: 1
+  # 发送小时 (0-23)
+  hour: 9
+  # 发送分钟 (0-59)
+  minute: 0
+
+# 日志配置
+log:
+  # 日志级别: debug, info, warn, error
+  level: info
+  # 日志文件路径
+  file: /opt/emqx/emqx-monitor/logs/emqx-monitor.log
+  # 最大日志文件大小 (MB)
+  max_size: 100
+  # 保留的旧日志文件数量
+  max_backups: 10
+  # 保留旧日志文件的最大天数
+  max_age: 30
+  # 是否压缩旧日志文件
+  compress: true
+
+# MQTT 连通性测试配置
+mqtt_test:
+  # 是否启用 MQTT 测试
+  enabled: true
+  # MQTT Broker 地址
+  broker: "YOUR_BROKER_IP:1883"
+  # 测试主题
+  topic: "test/monitor"
+  # 用户名
+  username: "YOUR_USERNAME"
+  # 密码
+  password: "YOUR_PASSWORD"
+  # 类别名称（用于告警消息）
+  class_name: "EMQX"
+  # 连接超时（秒）
+  timeout: 5
+  # 测试循环次数
+  test_loops: 5
+  # 测试间隔（秒）
+  test_interval: 10
+  # 失败告警阈值（连续失败多少次后发送告警）
+  failure_threshold: 1
+  # 测试执行时间（cron 格式，例如：每10分钟执行一次 "*/10 * * * *"）
+  # 留空则不自动执行，只能通过 API 手动触发
+  schedule: ""
+
+# ============================================
+# 需要替换的配置项说明：
+# ============================================
+# 1. webhook_url: YOUR_WEBHOOK_KEY
+#    -> 替换为你的企业微信机器人 Webhook Key
+#
+# 2. mqtt_test.broker: YOUR_BROKER_IP:1883
+#    -> 替换为你的 MQTT Broker 地址和端口
+#
+# 3. mqtt_test.username: YOUR_USERNAME
+#    -> 替换为你的 MQTT 用户名
+#
+# 4. mqtt_test.password: YOUR_PASSWORD
+#    -> 替换为你的 MQTT 密码
+# ============================================

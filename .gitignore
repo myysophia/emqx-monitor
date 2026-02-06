@@ -1,0 +1,44 @@
+# 编译输出
+bin/
+emqx-monitor
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go 工具文件
+*.test
+*.out
+go.work
+
+# 敏感配置文件
+config/config.yaml
+# 但保留示例文件
+!config.yaml.example
+
+# 日志文件
+logs/
+*.log
+
+# 临时文件
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# IDE 和编辑器
+.vscode/
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+
+# 备份文件
+*.bak
+*.backup
+
+# 系统文件
+.env
+.env.local
