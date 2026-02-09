@@ -91,6 +91,11 @@ type YAMLConfig struct {
 		MaxAge    int    `yaml:"max_age"`
 		Compress  bool   `yaml:"compress"`
 	} `yaml:"log"`
+	Alert           struct {
+		MinChange   int      `yaml:"min_change"`     // 最小下降数量阈值
+		MinPercent  float64  `yaml:"min_percent"`    // 最小下降百分比阈值
+		IgnoreUsers []string `yaml:"ignore_users"`   // 忽略的用户列表
+	} `yaml:"alert"`
 	MqttTest        struct {
 		Enabled          bool   `yaml:"enabled"`
 		Broker           string `yaml:"broker"`
@@ -125,6 +130,14 @@ type Config struct {
 	LogFile         string
 	Report          ReportConfig
 	MqttTest        MqttTestConfig
+	Alert           AlertConfig
+}
+
+// AlertConfig 告警配置
+type AlertConfig struct {
+	MinChange  int      // 最小下降数量阈值
+	MinPercent float64  // 最小下降百分比阈值
+	IgnoreUsers []string // 忽略的用户列表
 }
 
 // MqttTestConfig MQTT 测试配置
@@ -381,6 +394,11 @@ func loadConfig() {
 	config.MqttTest.TestLoops = yamlConfig.MqttTest.TestLoops
 	config.MqttTest.TestInterval = time.Duration(yamlConfig.MqttTest.TestInterval) * time.Second
 	config.MqttTest.FailureThreshold = yamlConfig.MqttTest.FailureThreshold
+
+	// 解析告警配置
+	config.Alert.MinChange = yamlConfig.Alert.MinChange
+	config.Alert.MinPercent = yamlConfig.Alert.MinPercent
+	config.Alert.IgnoreUsers = yamlConfig.Alert.IgnoreUsers
 }
 
 func loadDefaultConfig() {
@@ -394,6 +412,9 @@ func loadDefaultConfig() {
 	config.Report.Day = time.Monday
 	config.Report.Hour = 9
 	config.Report.Minute = 0
+	config.Alert.MinChange = 5       // 默认至少下降 5 个才告警
+	config.Alert.MinPercent = 30.0   // 默认至少下降 30% 才告警
+	config.Alert.IgnoreUsers = []string{} // 默认不忽略任何用户
 }
 
 func startCollector() {
@@ -520,17 +541,26 @@ func runAlertCheck() {
 	var momChanges []AlertChange
 	if prevHour != nil {
 		for _, stat := range currentStats {
+			// 跳过被忽略的用户
+			if isUserIgnored(stat.Username) {
+				continue
+			}
+
 			prevCount := prevHour.UserStats[stat.Username]
 			if stat.Count < prevCount {
 				change := prevCount - stat.Count
 				percent := float64(change) / float64(prevCount) * 100
-				momChanges = append(momChanges, AlertChange{
-					Username:      stat.Username,
-					Current:       stat.Count,
-					Previous:      prevCount,
-					Change:        change,
-					ChangePercent: percent,
-				})
+
+				// 检查是否满足告警阈值
+				if shouldAlert(change, percent, prevCount) {
+					momChanges = append(momChanges, AlertChange{
+						Username:      stat.Username,
+						Current:       stat.Count,
+						Previous:      prevCount,
+						Change:        change,
+						ChangePercent: percent,
+					})
+				}
 			}
 		}
 	}
@@ -540,17 +570,26 @@ func runAlertCheck() {
 	var yoyChanges []AlertChange
 	if lastWeek != nil {
 		for _, stat := range currentStats {
+			// 跳过被忽略的用户
+			if isUserIgnored(stat.Username) {
+				continue
+			}
+
 			prevCount := lastWeek.UserStats[stat.Username]
 			if stat.Count < prevCount {
 				change := prevCount - stat.Count
 				percent := float64(change) / float64(prevCount) * 100
-				yoyChanges = append(yoyChanges, AlertChange{
-					Username:      stat.Username,
-					Current:       stat.Count,
-					Previous:      prevCount,
-					Change:        change,
-					ChangePercent: percent,
-				})
+
+				// 检查是否满足告警阈值
+				if shouldAlert(change, percent, prevCount) {
+					yoyChanges = append(yoyChanges, AlertChange{
+						Username:      stat.Username,
+						Current:       stat.Count,
+						Previous:      prevCount,
+						Change:        change,
+						ChangePercent: percent,
+					})
+				}
 			}
 		}
 	}
@@ -560,18 +599,52 @@ func runAlertCheck() {
 	if prevHour != nil && currentTotal < prevHour.Total {
 		change := prevHour.Total - currentTotal
 		percent := float64(change) / float64(prevHour.Total) * 100
-		totalMom = fmt.Sprintf("⚠️ 总连接数减少 %d (%.1f%%)", change, percent)
+		// 检查是否满足告警阈值
+		if shouldAlert(change, percent, prevHour.Total) {
+			totalMom = fmt.Sprintf("⚠️ 总连接数减少 %d (%.1f%%)", change, percent)
+		}
 	}
 	if lastWeek != nil && currentTotal < lastWeek.Total {
 		change := lastWeek.Total - currentTotal
 		percent := float64(change) / float64(lastWeek.Total) * 100
-		totalYoy = fmt.Sprintf("⚠️ 总连接数减少 %d (%.1f%%)", change, percent)
+		// 检查是否满足告警阈值
+		if shouldAlert(change, percent, lastWeek.Total) {
+			totalYoy = fmt.Sprintf("⚠️ 总连接数减少 %d (%.1f%%)", change, percent)
+		}
 	}
 
 	// 如果有告警，发送企业微信通知
 	if len(momChanges) > 0 || len(yoyChanges) > 0 || totalMom != "" || totalYoy != "" {
 		sendAlert(momChanges, yoyChanges, totalMom, totalYoy, currentTotal)
 	}
+}
+
+// isUserIgnored 检查用户是否被忽略
+func isUserIgnored(username string) bool {
+	for _, ignored := range config.Alert.IgnoreUsers {
+		if ignored == username {
+			return true
+		}
+	}
+	return false
+}
+
+// shouldAlert 判断是否应该告警
+func shouldAlert(change int, percent float64, prevCount int) bool {
+	// 如果两个阈值都为 0，则保持原有行为（任何下降都告警）
+	if config.Alert.MinChange == 0 && config.Alert.MinPercent == 0 {
+		return true
+	}
+
+	// 满足任一条件即告警
+	if config.Alert.MinChange > 0 && change >= config.Alert.MinChange {
+		return true
+	}
+	if config.Alert.MinPercent > 0 && percent >= config.Alert.MinPercent {
+		return true
+	}
+
+	return false
 }
 
 func sendAlert(momChanges, yoyChanges []AlertChange, totalMom, totalYoy string, currentTotal int) {
@@ -805,6 +878,9 @@ func handleReload(w http.ResponseWriter, r *http.Request) {
 			"mqtt_enabled":       config.MqttTest.Enabled,
 			"failure_threshold":  config.MqttTest.FailureThreshold,
 			"webhook_url":        config.WebhookURL,
+			"alert_min_change":   config.Alert.MinChange,
+			"alert_min_percent":  config.Alert.MinPercent,
+			"alert_ignore_users": config.Alert.IgnoreUsers,
 		},
 	})
 }

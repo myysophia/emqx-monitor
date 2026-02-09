@@ -45,6 +45,23 @@ log:
   # 是否压缩旧日志文件
   compress: true
 
+# 告警配置
+alert:
+  # 最小下降数量阈值（低于此值不告警）
+  # 设置为 0 表示不限制数量
+  min_change: 5
+  # 最小下降百分比阈值（低于此值不告警）
+  # 设置为 0 表示不限制百分比
+  # 两个条件满足任一即触发告警
+  min_percent: 30.0
+  # 忽略的用户列表（这些用户不会触发告警）
+  # 留空表示不忽略任何用户
+  ignore_users: []
+  # 示例：忽略某些测试用户
+  # ignore_users:
+  #   - test_user
+  #   - debug_client
+
 # MQTT 连通性测试配置
 mqtt_test:
   # 是否启用 MQTT 测试
