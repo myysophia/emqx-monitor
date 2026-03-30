@@ -21,6 +21,9 @@ config/config.yaml
 logs/
 *.log
 
+# 数据文件
+data/
+
 # 临时文件
 *.tmp
 *.temp
