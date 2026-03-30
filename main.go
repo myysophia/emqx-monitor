@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"strconv"
 	"sync"
 	"time"
 
@@ -183,8 +185,377 @@ func InitLogger() *lumberjack.Logger {
 
 // HistoryStore 历史数据存储
 type HistoryStore struct {
-	mu   sync.RWMutex
-	data []HistoryData
+	mu        sync.RWMutex
+	data      []HistoryData
+	fileStore *FileStore
+}
+
+const retentionDays = 30
+
+// dashboardHTML 内嵌的前端趋势图页面
+const dashboardHTML = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EMQX Monitor</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { background: #1a1a2e; color: #e0e0e0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; padding: 20px; }
+.header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; flex-wrap: wrap; gap: 12px; }
+h1 { font-size: 1.5em; color: #00d4ff; }
+.controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.controls label { font-size: 0.9em; color: #888; }
+.btn { background: #16213e; color: #e0e0e0; border: 1px solid #0f3460; padding: 6px 14px; border-radius: 4px; cursor: pointer; font-size: 0.85em; }
+.btn:hover { background: #0f3460; }
+.btn.active { background: #0f3460; border-color: #00d4ff; color: #00d4ff; }
+.status { font-size: 0.8em; color: #666; }
+.stats-row { display: flex; gap: 16px; margin-bottom: 20px; flex-wrap: wrap; }
+.stat-card { background: #16213e; border: 1px solid #0f3460; border-radius: 8px; padding: 14px 20px; min-width: 140px; }
+.stat-card .label { font-size: 0.8em; color: #888; }
+.stat-card .value { font-size: 1.6em; color: #00d4ff; font-weight: bold; margin-top: 4px; }
+.chart-container { background: #16213e; border: 1px solid #0f3460; border-radius: 8px; padding: 16px; margin-bottom: 20px; position: relative; }
+.chart-container canvas { max-height: 380px; }
+.toggle { display: flex; gap: 12px; margin-bottom: 12px; }
+.toggle label { font-size: 0.85em; display: flex; align-items: center; gap: 4px; cursor: pointer; }
+.toggle input { cursor: pointer; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>EMQX Connection Monitor</h1>
+  <div class="controls">
+    <label>Range:</label>
+    <button class="btn" data-days="1">1D</button>
+    <button class="btn active" data-days="7">7D</button>
+    <button class="btn" data-days="14">14D</button>
+    <button class="btn" data-days="30">30D</button>
+    <span class="status" id="status"></span>
+  </div>
+</div>
+
+<div class="stats-row" id="statsRow"></div>
+
+<div class="chart-container">
+  <div class="toggle">
+    <label><input type="checkbox" id="showUsers" checked> Show by user</label>
+  </div>
+  <canvas id="trendChart"></canvas>
+</div>
+
+<script>
+const COLORS = ['#00d4ff','#ff6b6b','#ffd93d','#6bcb77','#4d96ff','#ff922b','#cc5de8','#20c997','#ff8787','#74c0fc'];
+let currentDays = 7;
+let chart = null;
+let refreshTimer = null;
+
+async function loadData(days) {
+  const resp = await fetch('/api/v1/clients/history?days=' + days);
+  return resp.json();
+}
+
+async function loadCurrentStats() {
+  try {
+    const resp = await fetch('/api/v1/clients/stats');
+    const data = await resp.json();
+    renderStats(data);
+  } catch(e) {}
+}
+
+function renderStats(data) {
+  const row = document.getElementById('statsRow');
+  let html = '<div class="stat-card"><div class="label">Total Connections</div><div class="value">' + data.total + '</div></div>';
+  html += '<div class="stat-card"><div class="label">Users</div><div class="value">' + data.data.length + '</div></div>';
+  html += '<div class="stat-card"><div class="label">Updated</div><div class="value" style="font-size:1em;color:#aaa">' + (data.timestamp || '-') + '</div></div>';
+  row.innerHTML = html;
+}
+
+function buildChart(data, showUsers) {
+  const ctx = document.getElementById('trendChart').getContext('2d');
+  if (chart) chart.destroy();
+
+  const labels = data.map(d => {
+    const t = new Date(d.timestamp);
+    return t.toLocaleString('zh-CN', { month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit' });
+  });
+
+  // Downsample for large datasets
+  const maxPoints = 800;
+  let sampled = data;
+  if (data.length > maxPoints) {
+    const step = Math.ceil(data.length / maxPoints);
+    sampled = data.filter((_, i) => i % step === 0);
+  }
+
+  const sLabels = sampled.map(d => {
+    const t = new Date(d.timestamp);
+    return t.toLocaleString('zh-CN', { month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit' });
+  });
+
+  const datasets = [];
+
+  if (showUsers) {
+    const users = new Set();
+    sampled.forEach(d => Object.keys(d.user_stats).forEach(u => users.add(u)));
+    let ci = 0;
+    users.forEach(u => {
+      datasets.push({
+        label: u,
+        data: sampled.map(d => d.user_stats[u] || 0),
+        borderColor: COLORS[ci % COLORS.length],
+        backgroundColor: COLORS[ci % COLORS.length] + '20',
+        borderWidth: 1.5,
+        pointRadius: 0,
+        tension: 0.3,
+        fill: false,
+      });
+      ci++;
+    });
+  }
+
+  datasets.unshift({
+    label: 'Total',
+    data: sampled.map(d => d.total),
+    borderColor: '#00d4ff',
+    backgroundColor: 'rgba(0,212,255,0.08)',
+    borderWidth: 2,
+    pointRadius: 0,
+    tension: 0.3,
+    fill: true,
+  });
+
+  chart = new Chart(ctx, {
+    type: 'line',
+    data: { labels: sLabels, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { labels: { color: '#aaa', boxWidth: 12, font: { size: 11 } } },
+        tooltip: { backgroundColor: '#16213e', borderColor: '#0f3460', borderWidth: 1 }
+      },
+      scales: {
+        x: { ticks: { color: '#666', maxTicksLimit: 12, font: { size: 10 } }, grid: { color: '#1a1a3e' } },
+        y: { ticks: { color: '#666', font: { size: 10 } }, grid: { color: '#1a1a3e' }, beginAtZero: true }
+      }
+    }
+  });
+}
+
+async function refresh() {
+  const status = document.getElementById('status');
+  status.textContent = 'Loading...';
+  try {
+    const data = await loadData(currentDays);
+    const showUsers = document.getElementById('showUsers').checked;
+    buildChart(data, showUsers);
+    status.textContent = data.length + ' points';
+  } catch(e) {
+    status.textContent = 'Error: ' + e.message;
+  }
+}
+
+// Range buttons
+document.querySelectorAll('.btn[data-days]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.btn[data-days]').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    currentDays = parseInt(btn.dataset.days);
+    refresh();
+  });
+});
+
+// Toggle by-user
+document.getElementById('showUsers').addEventListener('change', () => refresh());
+
+// Auto refresh
+function scheduleRefresh() {
+  if (refreshTimer) clearInterval(refreshTimer);
+  refreshTimer = setInterval(() => { refresh(); loadCurrentStats(); }, 30000);
+}
+
+// Init
+refresh();
+loadCurrentStats();
+scheduleRefresh();
+</script>
+</body>
+</html>`
+
+// FileStore 历史数据文件持久化（JSON Lines 格式）
+type FileStore struct {
+	filePath string
+	mu       sync.Mutex
+}
+
+func NewFileStore(filePath string) *FileStore {
+	return &FileStore{filePath: filePath}
+}
+
+// Append 将一条数据追加写入文件末尾
+func (fs *FileStore) Append(entry HistoryData) error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	f, err := os.OpenFile(fs.filePath, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
+	if err != nil {
+		return fmt.Errorf("open file for append: %w", err)
+	}
+	defer f.Close()
+
+	data, err := json.Marshal(entry)
+	if err != nil {
+		return fmt.Errorf("marshal entry: %w", err)
+	}
+
+	data = append(data, '\n')
+	if _, err := f.Write(data); err != nil {
+		return fmt.Errorf("write entry: %w", err)
+	}
+
+	return nil
+}
+
+// Load 从文件加载历史数据，过滤过期条目
+func (fs *FileStore) Load(retentionDays int) ([]HistoryData, error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	f, err := os.Open(fs.filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("open file for read: %w", err)
+	}
+	defer f.Close()
+
+	cutoff := time.Now().AddDate(0, 0, -retentionDays)
+	var entries []HistoryData
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
+
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+
+		var entry HistoryData
+		if err := json.Unmarshal(line, &entry); err != nil {
+			logWarn("FileStore: skipping corrupt line %d: %v", lineNum, err)
+			continue
+		}
+
+		if entry.Timestamp.After(cutoff) {
+			entries = append(entries, entry)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan file: %w", err)
+	}
+
+	logInfo("FileStore: loaded %d entries from %s", len(entries), fs.filePath)
+	return entries, nil
+}
+
+// Compact 重写文件，移除过期条目（原子替换）
+func (fs *FileStore) Compact(retentionDays int) error {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+
+	cutoff := time.Now().AddDate(0, 0, -retentionDays)
+
+	f, err := os.Open(fs.filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("open file for compaction: %w", err)
+	}
+	defer f.Close()
+
+	tmpPath := fs.filePath + ".tmp"
+	tmpF, err := os.Create(tmpPath)
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
+
+	retained := 0
+	removed := 0
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+
+		var entry HistoryData
+		if err := json.Unmarshal(line, &entry); err != nil {
+			tmpF.Write(line)
+			tmpF.Write([]byte{'\n'})
+			removed++
+			continue
+		}
+
+		if entry.Timestamp.After(cutoff) {
+			tmpF.Write(line)
+			tmpF.Write([]byte{'\n'})
+			retained++
+		} else {
+			removed++
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		tmpF.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("scan during compaction: %w", err)
+	}
+
+	if err := tmpF.Close(); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("close temp file: %w", err)
+	}
+
+	if err := os.Rename(tmpPath, fs.filePath); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("rename temp file: %w", err)
+	}
+
+	logInfo("FileStore: compacted: retained %d, removed %d entries", retained, removed)
+	return nil
+}
+
+// Init 加载持久化数据并初始化存储
+func (h *HistoryStore) Init(filePath string) error {
+	h.fileStore = NewFileStore(filePath)
+
+	dir := filepath.Dir(filePath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("create data directory: %w", err)
+	}
+
+	entries, err := h.fileStore.Load(retentionDays)
+	if err != nil {
+		logWarn("Failed to load history from disk: %v, starting fresh", err)
+		return nil
+	}
+
+	if len(entries) > 0 {
+		h.data = entries
+		logInfo("HistoryStore: restored %d entries from disk", len(entries))
+	}
+
+	return nil
 }
 
 func (h *HistoryStore) Add(stats []UserStat, total int) {
@@ -196,20 +567,52 @@ func (h *HistoryStore) Add(stats []UserStat, total int) {
 		userStats[s.Username] = s.Count
 	}
 
-	h.data = append(h.data, HistoryData{
+	entry := HistoryData{
 		Timestamp: time.Now(),
 		UserStats: userStats,
 		Total:     total,
-	})
+	}
+	h.data = append(h.data, entry)
+
+	// 持久化到磁盘（错误只记日志，不中断服务）
+	if h.fileStore != nil {
+		if err := h.fileStore.Append(entry); err != nil {
+			logError("Failed to persist history entry: %v", err)
+		}
+	}
 
 	// 保留最近 30 天的数据
-	cutoff := time.Now().AddDate(0, 0, -30)
+	cutoff := time.Now().AddDate(0, 0, -retentionDays)
 	for i, d := range h.data {
 		if d.Timestamp.After(cutoff) {
 			h.data = h.data[i:]
 			break
 		}
 	}
+}
+
+// CompactDisk 触发文件压缩
+func (h *HistoryStore) CompactDisk() {
+	if h.fileStore != nil {
+		if err := h.fileStore.Compact(retentionDays); err != nil {
+			logError("Failed to compact history file: %v", err)
+		}
+	}
+}
+
+// GetHistory 返回指定天数内的原始历史数据
+func (h *HistoryStore) GetHistory(days int) []HistoryData {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	cutoff := time.Now().AddDate(0, 0, -days)
+	var result []HistoryData
+	for _, d := range h.data {
+		if d.Timestamp.After(cutoff) {
+			result = append(result, d)
+		}
+	}
+	return result
 }
 
 func (h *HistoryStore) GetHourBefore(hour int) *HistoryData {
@@ -245,12 +648,15 @@ func (h *HistoryStore) GetSameHourLastWeek() *HistoryData {
 
 // DailyStats 每日统计
 type DailyStats struct {
-	Date      string         `json:"date"`
-	UserStats map[string]int `json:"user_stats"`
-	Total     int            `json:"total"`
+	Date         string            `json:"date"`
+	UserStats    map[string]int    `json:"user_stats"`    // 用户平均连接数
+	UserMaxStats map[string]int    `json:"user_max_stats"`// 用户峰值连接数
+	AvgTotal     int               `json:"avg_total"`     // 平均总连接数
+	MaxTotal     int               `json:"max_total"`     // 峰值总连接数
+	SampleCount  int               `json:"sample_count"`  // 采样次数
 }
 
-// GetDailyStats 获取最近 N 天的每日统计
+// GetDailyStats 获取最近 N 天的每日统计（计算平均值和峰值）
 func (h *HistoryStore) GetDailyStats(days int) []DailyStats {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
@@ -259,8 +665,16 @@ func (h *HistoryStore) GetDailyStats(days int) []DailyStats {
 		return nil
 	}
 
-	// 按天聚合数据
-	dailyMap := make(map[string]*DailyStats)
+	// 按天聚合数据 - 使用新的结构来跟踪总和、计数和最大值
+	type dailyAccumulator struct {
+		UserSums   map[string]int  // 用户连接数总和
+		UserMaxes  map[string]int  // 用户连接数峰值
+		TotalSum   int             // 总连接数总和
+		TotalMax   int             // 总连接数峰值
+		Count      int             // 采样次数
+	}
+
+	dailyMap := make(map[string]*dailyAccumulator)
 	now := time.Now()
 
 	for _, d := range h.data {
@@ -271,25 +685,50 @@ func (h *HistoryStore) GetDailyStats(days int) []DailyStats {
 
 		dateKey := d.Timestamp.Format("2006-01-02")
 		if dailyMap[dateKey] == nil {
-			dailyMap[dateKey] = &DailyStats{
-				Date:      dateKey,
-				UserStats: make(map[string]int),
-				Total:     0,
+			dailyMap[dateKey] = &dailyAccumulator{
+				UserSums:  make(map[string]int),
+				UserMaxes: make(map[string]int),
 			}
 		}
 
-		for user, count := range d.UserStats {
-			dailyMap[dateKey].UserStats[user] += count
+		acc := dailyMap[dateKey]
+		acc.Count++
+		acc.TotalSum += d.Total
+		if d.Total > acc.TotalMax {
+			acc.TotalMax = d.Total
 		}
-		dailyMap[dateKey].Total += d.Total
+
+		for user, count := range d.UserStats {
+			acc.UserSums[user] += count
+			if acc.UserMaxes[user] < count {
+				acc.UserMaxes[user] = count
+			}
+		}
 	}
 
-	// 转换为有序切片
+	// 转换为有序切片，计算平均值
 	var result []DailyStats
 	for i := days - 1; i >= 0; i-- {
 		date := now.AddDate(0, 0, -i).Format("2006-01-02")
-		if stats, ok := dailyMap[date]; ok {
-			result = append(result, *stats)
+		if acc, ok := dailyMap[date]; ok {
+			stats := DailyStats{
+				Date:         date,
+				UserStats:    make(map[string]int),
+				UserMaxStats: make(map[string]int),
+				MaxTotal:     acc.TotalMax,
+				SampleCount:  acc.Count,
+			}
+
+			// 计算用户平均连接数
+			if acc.Count > 0 {
+				stats.AvgTotal = acc.TotalSum / acc.Count
+				for user, sum := range acc.UserSums {
+					stats.UserStats[user] = sum / acc.Count
+					stats.UserMaxStats[user] = acc.UserMaxes[user]
+				}
+			}
+
+			result = append(result, stats)
 		}
 	}
 
@@ -307,11 +746,19 @@ func main() {
 	logInfo("Config: Namespace=%s, Pod=%s, CollectInterval=%v, CheckInterval=%v, Port=%d",
 		config.Namespace, config.Pod, config.CollectInterval, config.CheckInterval, config.ServerPort)
 
+	// 初始化历史数据持久化
+	if err := history.Init("/opt/emqx/emqx-monitor/data/history.jsonl"); err != nil {
+		logError("Failed to initialize history store: %v", err)
+	}
+
 	// 初始采集
 	collectData()
 
 	// 启动定时采集（30秒）
 	go startCollector()
+
+	// 启动历史文件压缩（每天凌晨 3 点）
+	go startCompaction()
 
 	// 启动告警检查（1小时）
 	go startAlertChecker()
@@ -431,6 +878,21 @@ func startAlertChecker() {
 	ticker := time.NewTicker(config.CheckInterval)
 	for range ticker.C {
 		runAlertCheck()
+	}
+}
+
+// startCompaction 每天凌晨 3 点执行历史文件压缩
+func startCompaction() {
+	for {
+		now := time.Now()
+		next := time.Date(now.Year(), now.Month(), now.Day(), 3, 0, 0, 0, now.Location())
+		if next.Before(now) {
+			next = next.Add(24 * time.Hour)
+		}
+		time.Sleep(next.Sub(now))
+
+		logInfo("Starting history file compaction...")
+		history.CompactDisk()
 	}
 }
 
@@ -728,12 +1190,14 @@ func sendWeChatMessage(msg WeChatMessage) error {
 
 func startServer() {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/", handleDashboard)
 	mux.HandleFunc("/api/v1/clients/stats", handleStats)
 	mux.HandleFunc("/api/v1/clients/check", handleManualCheck)
 	mux.HandleFunc("/api/v1/clients/test-alert", handleTestAlert)
 	mux.HandleFunc("/api/v1/clients/weekly-report", handleWeeklyReport)
 	mux.HandleFunc("/api/v1/mqtt/test", handleMqttTest)
 	mux.HandleFunc("/api/v1/reload", handleReload)
+	mux.HandleFunc("/api/v1/clients/history", handleHistory)
 
 	addr := fmt.Sprintf(":%d", config.ServerPort)
 	logInfo("Server started on %s", addr)
@@ -742,6 +1206,33 @@ func startServer() {
 		logError("Server failed: %v", err)
 		os.Exit(1)
 	}
+}
+
+func handleHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	days := 7
+	if d := r.URL.Query().Get("days"); d != "" {
+		if n, err := strconv.Atoi(d); err == nil && n >= 1 && n <= retentionDays {
+			days = n
+		}
+	}
+
+	data := history.GetHistory(days)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(data)
+}
+
+func handleDashboard(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, dashboardHTML)
 }
 
 func handleStats(w http.ResponseWriter, r *http.Request) {
@@ -938,9 +1429,9 @@ func sendWeeklyReport() {
 	var claudeData strings.Builder
 	claudeData.WriteString(fmt.Sprintf("报告时间: %s\n\n", time.Now().Format("2006-01-02 15:04:05")))
 	claudeData.WriteString("【本周数据】\n")
-	claudeData.WriteString("日期\t总连接数\n")
+	claudeData.WriteString("日期\t平均连接数\t峰值连接数\n")
 	for _, day := range thisWeek {
-		claudeData.WriteString(fmt.Sprintf("%s\t%d\n", day.Date, day.Total))
+		claudeData.WriteString(fmt.Sprintf("%s\t%d\t%d\n", day.Date, day.AvgTotal, day.MaxTotal))
 	}
 
 	// 按用户统计
@@ -956,7 +1447,9 @@ func sendWeeklyReport() {
 		for _, c := range counts {
 			avg += c
 		}
-		avg = avg / len(counts)
+		if len(counts) > 0 {
+			avg = avg / len(counts)
+		}
 		claudeData.WriteString(fmt.Sprintf("%s: 平均 %d, 数据: %v\n", user, avg, counts))
 	}
 
@@ -976,10 +1469,10 @@ func sendWeeklyReport() {
 
 	// 本周数据表格
 	content += "## 📈 本周数据\n\n"
-	content += "| 日期 | 总连接数 |\n"
-	content += "|------|----------|\n"
+	content += "| 日期 | 平均连接数 | 峰值连接数 | 采样次数 |\n"
+	content += "|------|------------|------------|----------|\n"
 	for _, day := range thisWeek {
-		content += fmt.Sprintf("| %s | %d |\n", day.Date, day.Total)
+		content += fmt.Sprintf("| %s | %d | %d | %d |\n", day.Date, day.AvgTotal, day.MaxTotal, day.SampleCount)
 	}
 
 	// 各用户当前连接数
