@@ -1,6 +1,8 @@
 # EMQX 监控服务
 
 EMQX 连接监控告警服务，支持连接数趋势分析、周报生成、MQTT 连通性测试。
+<img width="1900" height="648" alt="image" src="https://github.com/user-attachments/assets/543efd37-8563-4c0c-bce5-e0bdb6e0106a" />
+
 
 ## 功能特性
 
