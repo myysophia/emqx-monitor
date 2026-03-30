@@ -76,10 +76,10 @@ report:
 # MQTT 连通性测试配置
 mqtt_test:
   enabled: true
-  broker: "1.94.50.42:1883"
+  broker: "YOUR_BROKER:1883"
   topic: "test/monitor"
-  username: "novaems"
-  password: "novastar"
+  username: "YOUR_USERNAME"
+  password: "YOUR_PASSWORD"
   class_name: "EMQX"
   timeout: 5
   test_loops: 5
@@ -173,7 +173,7 @@ curl -X POST http://localhost:8080/api/v1/reload
   "status": "ok",
   "message": "Configuration reloaded",
   "config": {
-    "mqtt_broker": "1.94.50.42:1883",
+    "mqtt_broker": "YOUR_BROKER:1883",
     "mqtt_enabled": true,
     "failure_threshold": 1,
     "webhook_url": "https://qyapi.weixin.qq.com/..."
